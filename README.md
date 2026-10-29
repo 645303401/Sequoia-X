@@ -62,7 +62,7 @@ cp .env.example .env
 ### 3. 首次回填历史数据
 
 ```bash
-python main.py --backfill
+uv run python main.py --backfill
 ```
 
 约 12 分钟完成 ~5200 只 A 股历史后复权日 K 数据回填。
@@ -70,7 +70,7 @@ python main.py --backfill
 ### 4. 日常运行
 
 ```bash
-python main.py
+uv run python main.py
 ```
 
 建议配合 crontab 每个交易日收盘后自动执行：
