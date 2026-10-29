@@ -1,7 +1,5 @@
 """均线+成交量选股策略：5日均线上穿20日均线且成交量放大。"""
 
-import pandas as pd
-
 from sequoia_x.core.logger import get_logger
 from sequoia_x.strategy.base import BaseStrategy
 
@@ -20,6 +18,7 @@ class MaVolumeStrategy(BaseStrategy):
     """
 
     webhook_key: str = "ma_volume"
+    _MIN_BARS: int = 21
 
     def run(self) -> list[str]:
         """
@@ -31,25 +30,25 @@ class MaVolumeStrategy(BaseStrategy):
         symbols = self.engine.get_local_symbols()
         selected: list[str] = []
 
-        for symbol in symbols:
+        market_data = self.engine.get_ohlcv_bulk(symbols)
+        if market_data.empty or "symbol" not in market_data:
+            return selected
+        for symbol, df in market_data.groupby("symbol", sort=False):
             try:
-                df = self.engine.get_ohlcv(symbol)
-                if len(df) < 20:
+                if len(df) < self._MIN_BARS:
                     continue
 
                 # 向量化计算均线和成交量均值
                 df["ma5"] = df["close"].rolling(5).mean()
                 df["ma20"] = df["close"].rolling(20).mean()
-                df["vol_ma20"] = df["volume"].rolling(20).mean()
+                # 只用前 20 个交易日作为比较基准，避免把今日放量混入均值。
+                df["vol_ma20"] = df["volume"].shift(1).rolling(20).mean()
 
                 # 取最后两行判断金叉（昨日 ma5 < ma20，今日 ma5 > ma20）
                 last = df.iloc[-1]
                 prev = df.iloc[-2]
 
-                golden_cross = (
-                    prev["ma5"] < prev["ma20"]
-                    and last["ma5"] > last["ma20"]
-                )
+                golden_cross = prev["ma5"] < prev["ma20"] and last["ma5"] > last["ma20"]
                 volume_surge = last["volume"] > last["vol_ma20"] * 1.5
 
                 if golden_cross and volume_surge:

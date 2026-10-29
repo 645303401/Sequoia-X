@@ -33,9 +33,11 @@ class UptrendLimitDownStrategy(BaseStrategy):
         symbols = self.engine.get_local_symbols()
         selected: list[str] = []
 
-        for symbol in symbols:
+        market_data = self.engine.get_ohlcv_bulk(symbols)
+        if market_data.empty or "symbol" not in market_data:
+            return selected
+        for symbol, df in market_data.groupby("symbol", sort=False):
             try:
-                df = self.engine.get_ohlcv(symbol)
                 if len(df) < self._MIN_BARS:
                     continue
 
@@ -53,7 +55,8 @@ class UptrendLimitDownStrategy(BaseStrategy):
                 # 条件 1：上升趋势（昨日均线多头排列）
                 uptrend = prev["ma20"] > prev["ma60"]
                 # 条件 2：放量跌停
-                limit_down = today["close"] <= prev["close"] * 0.905
+                limit_ratio = self._limit_ratio(symbol)
+                limit_down = today["close"] <= prev["close"] * (1 - limit_ratio + 0.005)
                 volume_surge = today["volume"] > today["vol_ma20"] * 2.0
 
                 if uptrend and limit_down and volume_surge:

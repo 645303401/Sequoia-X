@@ -1,7 +1,5 @@
 """高旗形整理策略：强动量后极度收敛缩量。"""
 
-import pandas as pd
-
 from sequoia_x.core.logger import get_logger
 from sequoia_x.strategy.base import BaseStrategy
 
@@ -33,9 +31,11 @@ class HighTightFlagStrategy(BaseStrategy):
         symbols = self.engine.get_local_symbols()
         selected: list[str] = []
 
-        for symbol in symbols:
+        market_data = self.engine.get_ohlcv_bulk(symbols)
+        if market_data.empty or "symbol" not in market_data:
+            return selected
+        for symbol, df in market_data.groupby("symbol", sort=False):
             try:
-                df = self.engine.get_ohlcv(symbol)
                 if len(df) < self._MIN_BARS:
                     continue
 

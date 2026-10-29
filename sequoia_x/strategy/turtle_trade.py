@@ -14,7 +14,9 @@ class TurtleTradeStrategy(BaseStrategy):
     选股条件（向量化，严禁 iterrows）：
     1. 突破新高：今日 close > 前20个交易日 high 的最大值
     2. 流动性：今日 turnover > 100,000,000
-    3. 防诱多过滤：今日必须是实体阳线（今日 close > 今日 open），且必须真涨（今日 close > 昨日 close）
+    3. 防诱多过滤：今日必须是实体阳线（今日 close > 今日 open），
+       且必须真涨（今日 close > 昨日 close）
+    4. 结果按成交额排序，优先观察流动性更好的股票
 
     Attributes:
         webhook_key: 路由到 'turtle' 专属飞书机器人。
@@ -70,10 +72,11 @@ class TurtleTradeStrategy(BaseStrategy):
         """
         symbols = self.engine.get_local_symbols()
         candidates: list[str] = []
+        turnovers: dict[str, float] = {}
 
-        for symbol in symbols:
+        market_data = self.engine.get_ohlcv_bulk(symbols)
+        for symbol, df in market_data.groupby("symbol", sort=False):
             try:
-                df = self.engine.get_ohlcv(symbol)
                 if len(df) < self._MIN_BARS:
                     continue
 
@@ -92,20 +95,19 @@ class TurtleTradeStrategy(BaseStrategy):
                 liquid = last["turnover"] > 100_000_000
 
                 # 【新增防守条件】拒绝郑州煤电式的高开低走大阴线！
-                is_yang = last["close"] > last["open"]   # 实体必须是阳线（红柱）
-                is_up = last["close"] > prev["close"]    # 必须是真涨，不能是假阳线
+                is_yang = last["close"] > last["open"]  # 实体必须是阳线（红柱）
+                is_up = last["close"] > prev["close"]  # 必须是真涨，不能是假阳线
 
                 if breakout and liquid and is_yang and is_up:
                     candidates.append(symbol)
+                    turnovers[symbol] = float(last["turnover"])
 
             except Exception as exc:
                 logger.warning(f"[{symbol}] TurtleTradeStrategy 计算失败：{exc}")
                 continue
 
-        # 按流通市值从大到小排序
-        if candidates:
-            market_caps = self._get_market_caps(candidates)
-            candidates.sort(key=lambda s: market_caps.get(s, 0), reverse=True)
+        # 按成交额从大到小排序，避免为排序给每只候选股额外请求接口。
+        candidates.sort(key=lambda s: turnovers.get(s, 0), reverse=True)
 
         logger.info(f"TurtleTradeStrategy 选出 {len(candidates)} 只股票")
         return candidates

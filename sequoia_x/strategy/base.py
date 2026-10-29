@@ -30,6 +30,16 @@ class BaseStrategy(ABC):
         self.engine = engine
         self.settings = settings
 
+    @staticmethod
+    def _limit_ratio(symbol: str) -> float:
+        """返回按板块估算的日涨跌停幅度；ST 等特殊状态需额外股票状态数据。"""
+        code = str(symbol).split(".")[-1]
+        if code.startswith(("4", "8", "920")):
+            return 0.30
+        if code.startswith(("300", "688")):
+            return 0.20
+        return 0.10
+
     @abstractmethod
     def run(self) -> list[str]:
         """

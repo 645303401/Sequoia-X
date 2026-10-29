@@ -30,10 +30,10 @@ class FeishuNotifier:
 
     @staticmethod
     def _to_xueqiu_code(code: str) -> str:
-        """将纯数字代码转为雪球格式：6开头→SH，4/8开头→BJ，其余→SZ。"""
+        """将纯数字代码转为雪球格式：6开头→SH，4/8/920开头→BJ，其余→SZ。"""
         if code.startswith("6"):
             return f"SH{code}"
-        elif code.startswith(("4", "8")):
+        elif code.startswith(("4", "8", "920")):
             return f"BJ{code}"
         return f"SZ{code}"
 
@@ -41,10 +41,16 @@ class FeishuNotifier:
     def _get_stock_names(symbols: list[str]) -> dict[str, str]:
         """通过 baostock 批量查询股票名称，返回 {code: name} 映射。"""
         import baostock as bs
+
         bs.login()
         mapping = {}
         for code in symbols:
-            prefix = "sh" if code.startswith(("6", "9")) else "sz"
+            if code.startswith(("4", "8", "920")):
+                prefix = "bj"
+            elif code.startswith(("6", "9")):
+                prefix = "sh"
+            else:
+                prefix = "sz"
             rs = bs.query_stock_basic(code=f"{prefix}.{code}")
             while rs.next():
                 row = rs.get_row_data()
@@ -79,7 +85,10 @@ class FeishuNotifier:
                         "tag": "div",
                         "text": {
                             "tag": "lark_md",
-                            "content": f"**日期：** {today}\n**策略：** {strategy_name}\n**选股数量：** {len(symbols)}",
+                            "content": (
+                                f"**日期：** {today}\n**策略：** {strategy_name}\n"
+                                f"**选股数量：** {len(symbols)}"
+                            ),
                         },
                     },
                     {"tag": "hr"},
@@ -130,8 +139,7 @@ class FeishuNotifier:
             # 飞书真正的成功标志是内部的 code == 0
             if resp.status_code != 200 or resp_json.get("code") != 0:
                 logger.error(
-                    f"飞书推送失败 [{webhook_key}] "
-                    f"HTTP状态={resp.status_code} 飞书响应={resp.text}"
+                    f"飞书推送失败 [{webhook_key}] HTTP状态={resp.status_code} 飞书响应={resp.text}"
                 )
             else:
                 logger.info(f"飞书推送成功 [{webhook_key}]，共 {len(symbols)} 只股票")

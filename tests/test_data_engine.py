@@ -1,12 +1,14 @@
 """数据引擎属性测试。"""
 
 import sqlite3
+import sys
 import tempfile
 from datetime import date
 from pathlib import Path
 
 import pandas as pd
-from hypothesis import given, settings as h_settings
+from hypothesis import given
+from hypothesis import settings as h_settings
 from hypothesis import strategies as st
 
 from sequoia_x.core.config import Settings
@@ -35,9 +37,14 @@ def test_unique_symbol_date_constraint(symbol: str, trade_date: date) -> None:
     with tempfile.TemporaryDirectory() as tmp_dir:
         engine, _ = make_engine_in(tmp_dir)
         row = {
-            "symbol": symbol, "date": str(trade_date),
-            "open": 10.0, "high": 11.0, "low": 9.0, "close": 10.5,
-            "volume": 1000.0, "turnover": 10500.0,
+            "symbol": symbol,
+            "date": str(trade_date),
+            "open": 10.0,
+            "high": 11.0,
+            "low": 9.0,
+            "close": 10.5,
+            "volume": 1000.0,
+            "turnover": 10500.0,
         }
         df = pd.DataFrame([row])
         with sqlite3.connect(engine.db_path) as conn:
@@ -51,3 +58,56 @@ def test_unique_symbol_date_constraint(symbol: str, trade_date: date) -> None:
                 (symbol, str(trade_date)),
             ).fetchone()[0]
         assert count == 1
+
+
+def test_to_baostock_code_supports_bse_codes() -> None:
+    """北交所 4/8/920 开头代码必须映射到 baostock 的 bj 市场。"""
+    assert DataEngine._to_baostock_code("430047") == "bj.430047"
+    assert DataEngine._to_baostock_code("830799") == "bj.830799"
+    assert DataEngine._to_baostock_code("920001") == "bj.920001"
+    assert DataEngine._to_baostock_code("bj.430047") == "bj.430047"
+
+
+def test_get_all_symbols_uses_named_stock_basic_fields(monkeypatch) -> None:
+    """按字段名读取 baostock 结果，避免字段顺序变化导致股票被过滤。"""
+
+    class FakeResult:
+        fields = ["code", "code_name", "ipoDate", "outDate", "type", "status"]
+        error_code = "0"
+
+        def __init__(self) -> None:
+            self._rows = iter(
+                [
+                    ["bj.430047", "中国重工", "2014-01-01", "", "1", "1"],
+                    ["sz.000001", "平安银行", "1991-04-03", "", "1", "1"],
+                    ["bj.430048", "已退市", "2014-01-01", "2025-01-01", "1", "0"],
+                ]
+            )
+
+        def next(self) -> bool:
+            try:
+                self._current = next(self._rows)
+            except StopIteration:
+                return False
+            return True
+
+        def get_row_data(self) -> list[str]:
+            return self._current
+
+    class FakeBaostock:
+        @staticmethod
+        def login():
+            return type("LoginResult", (), {"error_code": "0", "error_msg": ""})()
+
+        @staticmethod
+        def query_stock_basic(**_kwargs):
+            return FakeResult()
+
+        @staticmethod
+        def logout():
+            return None
+
+    monkeypatch.setitem(sys.modules, "baostock", FakeBaostock)
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        engine, _ = make_engine_in(tmp_dir)
+        assert engine.get_all_symbols() == ["430047", "000001"]

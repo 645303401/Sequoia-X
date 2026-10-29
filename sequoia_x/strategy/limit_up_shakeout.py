@@ -1,7 +1,5 @@
 """涨停洗盘策略：昨日涨停后今日放量收阴但不破昨收。"""
 
-import pandas as pd
-
 from sequoia_x.core.logger import get_logger
 from sequoia_x.strategy.base import BaseStrategy
 
@@ -34,9 +32,11 @@ class LimitUpShakeoutStrategy(BaseStrategy):
         symbols = self.engine.get_local_symbols()
         selected: list[str] = []
 
-        for symbol in symbols:
+        market_data = self.engine.get_ohlcv_bulk(symbols)
+        if market_data.empty or "symbol" not in market_data:
+            return selected
+        for symbol, df in market_data.groupby("symbol", sort=False):
             try:
-                df = self.engine.get_ohlcv(symbol)
                 if len(df) < self._MIN_BARS:
                     continue
 
@@ -46,7 +46,9 @@ class LimitUpShakeoutStrategy(BaseStrategy):
                 today = df.iloc[-1]  # 今日
 
                 # 条件 1：昨日涨停
-                limit_up_yesterday = prev1["close"] >= prev2["close"] * 1.095
+                limit_ratio = self._limit_ratio(symbol)
+                # 0.5% 容差覆盖四舍五入；ST 等特殊状态无法仅凭 OHLCV 识别。
+                limit_up_yesterday = prev1["close"] >= prev2["close"] * (1 + limit_ratio - 0.005)
                 # 条件 2：今日收阴
                 bearish_today = today["close"] < today["open"]
                 # 条件 3：今日放量
