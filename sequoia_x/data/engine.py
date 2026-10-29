@@ -1,6 +1,7 @@
 """数据引擎模块：负责 SQLite 行情数据存储与 baostock 增量同步。"""
 
 import sqlite3
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -9,6 +10,10 @@ from sequoia_x.core.config import Settings
 from sequoia_x.core.logger import get_logger
 
 logger = get_logger(__name__)
+
+DEFAULT_MARKET_INDEXES = {
+    "sh.000001": "上证指数",
+}
 
 
 _CREATE_TABLE_SQL = """
@@ -30,6 +35,32 @@ _CREATE_INDEX_SQL = """
 CREATE INDEX IF NOT EXISTS idx_symbol_date ON stock_daily (symbol, date);
 """
 
+_CREATE_STOCK_BASIC_SQL = """
+CREATE TABLE IF NOT EXISTS stock_basic (
+    symbol TEXT PRIMARY KEY,
+    name   TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
+_CREATE_MARKET_DAILY_SQL = """
+CREATE TABLE IF NOT EXISTS market_daily (
+    index_code TEXT NOT NULL,
+    date       TEXT NOT NULL,
+    open       REAL,
+    high       REAL,
+    low        REAL,
+    close      REAL,
+    volume     REAL,
+    turnover   REAL,
+    UNIQUE (index_code, date)
+);
+"""
+
+_CREATE_MARKET_INDEX_SQL = """
+CREATE INDEX IF NOT EXISTS idx_market_index_date ON market_daily (index_code, date);
+"""
+
 _UPSERT_SQL = """
 INSERT INTO stock_daily (
     symbol, date, open, high, low, close, volume, turnover
@@ -43,27 +74,82 @@ ON CONFLICT(symbol, date) DO UPDATE SET
     turnover = excluded.turnover
 """
 
+_MARKET_UPSERT_SQL = """
+INSERT INTO market_daily (
+    index_code, date, open, high, low, close, volume, turnover
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(index_code, date) DO UPDATE SET
+    open = excluded.open,
+    high = excluded.high,
+    low = excluded.low,
+    close = excluded.close,
+    volume = excluded.volume,
+    turnover = excluded.turnover
+"""
 
-def _bs_fetch_batch(tasks: list) -> list:
-    """多进程 worker：独立 login，批量拉取 baostock 数据。"""
-    import baostock as bs
 
-    bs.login()
-    results = []
-    try:
-        for symbol, bs_code, start, end in tasks:
+def _login_baostock(bs) -> bool:
+    result = bs.login()
+    if result.error_code != "0":
+        logger.warning(f"baostock 登录失败：{result.error_msg}")
+        return False
+    return True
+
+
+def _query_history_with_retry(
+    bs,
+    bs_code: str,
+    start: str,
+    end: str,
+    adjustflag: str = "1",
+    max_retries: int = 3,
+) -> list[list[str]]:
+    """查询日线并在网络异常时重连、退避重试。"""
+    for attempt in range(max_retries):
+        try:
             rs = bs.query_history_k_data_plus(
                 bs_code,
                 "date,open,high,low,close,volume,amount",
                 start_date=start,
                 end_date=end,
                 frequency="d",
-                adjustflag="1",  # 后复权
+                adjustflag=adjustflag,
             )
-            if rs.error_code != "0":
-                continue
+            if rs is None or rs.error_code != "0":
+                message = getattr(rs, "error_msg", "查询返回为空")
+                raise RuntimeError(message)
+
+            rows = []
             while rs.next():
-                results.append([symbol] + rs.get_row_data())
+                rows.append(rs.get_row_data())
+            return rows
+        except Exception as exc:
+            if attempt >= max_retries - 1:
+                logger.warning(f"[{bs_code}] {max_retries} 次请求失败：{exc}")
+                return []
+            wait = min(2 ** (attempt + 1), 8)
+            logger.warning(f"[{bs_code}] 第 {attempt + 1} 次请求失败：{exc}，{wait}s 后重试")
+            try:
+                bs.logout()
+            except Exception:
+                pass
+            time.sleep(wait)
+            if not _login_baostock(bs):
+                time.sleep(wait)
+    return []
+
+
+def _bs_fetch_batch(tasks: list) -> list:
+    """多进程 worker：独立 login，批量拉取 baostock 数据。"""
+    import baostock as bs
+
+    if not _login_baostock(bs):
+        return []
+    results = []
+    try:
+        for symbol, bs_code, start, end in tasks:
+            rows = _query_history_with_retry(bs, bs_code, start, end)
+            results.extend([symbol] + row for row in rows)
     finally:
         bs.logout()
     return results
@@ -82,6 +168,9 @@ class DataEngine:
         with sqlite3.connect(self.db_path) as conn:
             conn.execute(_CREATE_TABLE_SQL)
             conn.execute(_CREATE_INDEX_SQL)
+            conn.execute(_CREATE_STOCK_BASIC_SQL)
+            conn.execute(_CREATE_MARKET_DAILY_SQL)
+            conn.execute(_CREATE_MARKET_INDEX_SQL)
             conn.commit()
         logger.info(f"数据库初始化完成：{self.db_path}")
 
@@ -176,7 +265,8 @@ class DataEngine:
 
         logger.info(f"需要更新 {len(tasks)} 只股票，启动多进程并行拉取...")
 
-        n_workers = min(8, len(tasks))
+        # 公共 baostock 服务对并发连接较敏感，4 个 worker 比 8 个更稳。
+        n_workers = min(4, len(tasks))
         chunks = [tasks[i::n_workers] for i in range(n_workers)]
 
         with Pool(n_workers) as pool:
@@ -211,6 +301,125 @@ class DataEngine:
 
         logger.info(f"sync_today_bulk: 写入或更新 {count} 条数据")
         return len(records)
+
+    def sync_market_index(
+        self,
+        index_codes: dict[str, str] | None = None,
+        max_retries: int = 3,
+    ) -> int:
+        """同步大盘指数日线，默认使用上证指数作为市场状态基准。"""
+        from datetime import date, timedelta
+
+        import baostock as bs
+
+        indexes = index_codes or DEFAULT_MARKET_INDEXES
+        today_str = date.today().strftime("%Y-%m-%d")
+        with sqlite3.connect(self.db_path) as conn:
+            last_dates = dict(
+                conn.execute(
+                    "SELECT index_code, MAX(date) FROM market_daily GROUP BY index_code"
+                ).fetchall()
+            )
+
+        tasks = []
+        for index_code in indexes:
+            last_date = last_dates.get(index_code)
+            if last_date and last_date >= today_str:
+                continue
+            start = self.start_date
+            if last_date:
+                start = (date.fromisoformat(last_date) + timedelta(days=1)).strftime("%Y-%m-%d")
+            tasks.append((index_code, start, today_str))
+
+        if not tasks:
+            logger.info("大盘指数已是最新，无需更新")
+            return 0
+
+        if not _login_baostock(bs):
+            logger.error("大盘指数同步登录失败")
+            return 0
+
+        records = []
+        try:
+            for index_code, start, end in tasks:
+                rows = _query_history_with_retry(
+                    bs,
+                    index_code,
+                    start,
+                    end,
+                    adjustflag="3",
+                    max_retries=max_retries,
+                )
+                records.extend((index_code, row[0], *row[1:]) for row in rows)
+        finally:
+            bs.logout()
+
+        if not records:
+            logger.warning("大盘指数没有获取到新数据")
+            return 0
+
+        with sqlite3.connect(self.db_path) as conn:
+            conn.executemany(_MARKET_UPSERT_SQL, records)
+            conn.commit()
+        logger.info(f"大盘指数同步完成，写入或更新 {len(records)} 条数据")
+        return len(records)
+
+    def get_market_regime(self, index_code: str = "sh.000001") -> pd.DataFrame:
+        """按 20/60 日均线和 20 日涨跌幅划分大盘状态。
+
+        优先使用 market_daily 中的真实指数；指数暂时不可用时，
+        回退到股票池等权日收益代理，并在 source 列标记来源。
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            df = pd.read_sql(
+                """
+                SELECT date, close
+                FROM market_daily
+                WHERE index_code = ?
+                ORDER BY date
+                """,
+                conn,
+                params=(index_code,),
+            )
+
+        if df.empty:
+            with sqlite3.connect(self.db_path) as conn:
+                stock_df = pd.read_sql(
+                    "SELECT symbol, date, close FROM stock_daily ORDER BY symbol, date",
+                    conn,
+                )
+            if stock_df.empty:
+                return stock_df
+            stock_df["date"] = pd.to_datetime(stock_df["date"])
+            stock_df["daily_return"] = (
+                stock_df["close"] / stock_df.groupby("symbol")["close"].shift(1) - 1
+            )
+            daily = (
+                stock_df.groupby("date")["daily_return"]
+                .agg(
+                    market_return="median",
+                    breadth=lambda values: (values > 0).mean(),
+                )
+                .reset_index()
+            )
+            daily["close"] = (1 + daily["market_return"].fillna(0)).cumprod() * 100
+            df = daily[["date", "close"]]
+            source = "stock_equal_weight_proxy"
+        else:
+            df["date"] = pd.to_datetime(df["date"])
+            source = index_code
+
+        df["ma20"] = df["close"].rolling(20).mean()
+        df["ma60"] = df["close"].rolling(60).mean()
+        df["return20"] = df["close"].pct_change(20)
+        df["source"] = source
+        df["regime"] = "横盘"
+        up = (df["close"] > df["ma60"]) & (df["ma20"] > df["ma60"]) & (df["return20"] >= 0.03)
+        down = (df["close"] < df["ma60"]) & (df["ma20"] < df["ma60"]) & (df["return20"] <= -0.03)
+        df.loc[up, "regime"] = "上升"
+        df.loc[down, "regime"] = "下降"
+        df.loc[df[["ma20", "ma60", "return20"]].isna().any(axis=1), "regime"] = "数据不足"
+        return df
 
     def backfill(self, symbols: list[str]) -> None:
         """通过 baostock 批量回填历史日 K 线数据（后复权）。
@@ -372,16 +581,33 @@ class DataEngine:
             rs = bs.query_stock_basic(code_name="", code="")
             field_indexes = {field: index for index, field in enumerate(rs.fields)}
             code_index = field_indexes.get("code", 0)
+            name_index = field_indexes.get("code_name", 1)
             type_index = field_indexes.get("type", 4)
             status_index = field_indexes.get("status", 5)
             symbols = []
+            name_records = []
             while rs.next():
                 row = rs.get_row_data()
                 code = row[code_index]
+                symbol = code.split(".", 1)[-1]
                 stock_type = row[type_index]  # "1" = 股票
                 status = row[status_index]  # "1" = 上市
                 if status == "1" and stock_type == "1":
-                    symbols.append(code.split(".", 1)[-1])  # 提取纯数字代码
+                    symbols.append(symbol)
+                    name_records.append((symbol, row[name_index]))
+            if name_records:
+                with sqlite3.connect(self.db_path) as conn:
+                    conn.executemany(
+                        """
+                        INSERT INTO stock_basic (symbol, name, updated_at)
+                        VALUES (?, ?, CURRENT_TIMESTAMP)
+                        ON CONFLICT(symbol) DO UPDATE SET
+                            name = excluded.name,
+                            updated_at = CURRENT_TIMESTAMP
+                        """,
+                        name_records,
+                    )
+                    conn.commit()
             logger.info(f"获取股票列表完成，共 {len(symbols)} 只")
             return symbols
         except Exception as e:

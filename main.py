@@ -6,27 +6,42 @@
 """
 
 import argparse
-import sys
-from dotenv import load_dotenv
-load_dotenv()
-
-from datetime import date
-
 import socket
-socket.setdefaulttimeout(10.0)
+import sys
+
+from dotenv import load_dotenv
 
 from sequoia_x.core.config import get_settings
 from sequoia_x.core.logger import get_logger
 from sequoia_x.data.engine import DataEngine
 from sequoia_x.notify.feishu import FeishuNotifier
-from sequoia_x.strategy.base import BaseStrategy
 from sequoia_x.strategy.high_tight_flag import HighTightFlagStrategy
-from sequoia_x.strategy.limit_up_shakeout import LimitUpShakeoutStrategy
 from sequoia_x.strategy.ma_volume import MaVolumeStrategy
-from sequoia_x.strategy.turtle_trade import TurtleTradeStrategy
-from sequoia_x.strategy.uptrend_limit_down import UptrendLimitDownStrategy
 from sequoia_x.strategy.rps_breakout import RpsBreakoutStrategy
-from sequoia_x.strategy.private_placement import PrivatePlacementStrategy
+from sequoia_x.strategy.turtle_trade import TurtleTradeStrategy
+
+load_dotenv()
+# baostock 公共服务偶尔响应较慢，给 socket 留出重试空间。
+socket.setdefaulttimeout(30.0)
+
+
+def _build_combined_results(strategy_results: dict[str, list[str]]) -> list[tuple[str, list[str]]]:
+    """生成每日只需推送的两个策略交集结果。"""
+    ma_volume = set(strategy_results.get("MaVolumeStrategy", []))
+    rps = set(strategy_results.get("RpsBreakoutStrategy", []))
+    turtle = set(strategy_results.get("TurtleTradeStrategy", []))
+    high_tight = set(strategy_results.get("HighTightFlagStrategy", []))
+
+    return [
+        (
+            "均线放量 + RPS突破 + 海龟突破",
+            sorted(ma_volume & rps & turtle),
+        ),
+        (
+            "RPS突破 + 高位旗形整理",
+            sorted(rps & high_tight),
+        ),
+    ]
 
 
 def main() -> None:
@@ -54,6 +69,7 @@ def main() -> None:
             logger.info("进入回填模式...")
             all_symbols = engine.get_all_symbols()
             engine.backfill(all_symbols)
+            engine.sync_market_index()
             logger.info("Sequoia-X V2 回填模式运行完成")
             return
 
@@ -61,36 +77,31 @@ def main() -> None:
         logger.info("开始拉取最新快照...")
         count = engine.sync_today_bulk()
         logger.info(f"快照同步完成，写入 {count} 只股票")
+        market_count = engine.sync_market_index()
+        logger.info(f"大盘指数同步完成，写入 {market_count} 条数据")
 
-        # 4. 策略列表（新增策略在此追加即可）
-        strategies: list[BaseStrategy] = [
+        # 4. 只执行用于两个组合交集的基础策略
+        strategies = [
             MaVolumeStrategy(engine=engine, settings=settings),
             TurtleTradeStrategy(engine=engine, settings=settings),
             HighTightFlagStrategy(engine=engine, settings=settings),
-            LimitUpShakeoutStrategy(engine=engine, settings=settings),
-            UptrendLimitDownStrategy(engine=engine, settings=settings),
             RpsBreakoutStrategy(engine=engine, settings=settings),
-            PrivatePlacementStrategy(engine=engine, settings=settings),
         ]
 
         notifier = FeishuNotifier(settings)
 
-        # 5. 遍历策略，有结果则推送至对应机器人
+        # 5. 计算基础策略结果，只推送指定的两个交集组合
+        strategy_results: dict[str, list[str]] = {}
         for strategy in strategies:
             strategy_name = type(strategy).__name__
             logger.info(f"执行策略：{strategy_name}")
 
             selected: list[str] = strategy.run()
             logger.info(f"{strategy_name} 选出 {len(selected)} 只股票")
+            strategy_results[strategy_name] = selected
 
-            if selected:
-                notifier.send(
-                    symbols=selected,
-                    strategy_name=strategy_name,
-                    webhook_key=strategy.webhook_key,
-                )
-            else:
-                logger.info(f"{strategy_name} 无选股结果，跳过推送")
+        combined_results = _build_combined_results(strategy_results)
+        notifier.send_combined_results(combined_results, webhook_key="default")
 
     except Exception:
         try:
@@ -98,6 +109,7 @@ def main() -> None:
             _logger.exception("主流程发生未捕获异常，程序终止")
         except Exception:
             import traceback
+
             traceback.print_exc()
         sys.exit(1)
 

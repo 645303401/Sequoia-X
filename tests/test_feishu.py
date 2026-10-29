@@ -1,11 +1,12 @@
 """飞书通知属性测试。"""
 
 import json
-import logging
+import sqlite3
+import tempfile
 from unittest.mock import MagicMock, patch
 
-import pytest
-from hypothesis import given, settings as h_settings
+from hypothesis import given
+from hypothesis import settings as h_settings
 from hypothesis import strategies as st
 
 from sequoia_x.core.config import Settings
@@ -82,6 +83,7 @@ def test_notification_uses_config_url(webhook_url: str) -> None:
 def test_http_failure_logs_error(status_code: int) -> None:
     """属性 12：非 200 响应时，send() 应记录 ERROR 级别日志，不抛出异常。"""
     import logging as _logging
+
     import sequoia_x.notify.feishu as feishu_module
 
     settings = make_settings()
@@ -106,3 +108,35 @@ def test_http_failure_logs_error(status_code: int) -> None:
         feishu_logger.removeHandler(handler)
 
     assert any(r.levelno == _logging.ERROR for r in log_records)
+
+
+def test_combined_card_contains_only_code_name_and_empty_message() -> None:
+    notifier = FeishuNotifier(make_settings())
+    with patch.object(notifier, "_get_stock_names", return_value={"000001": "平安银行"}):
+        payload = notifier._build_combined_card(
+            [
+                ("均线放量 + RPS突破 + 海龟突破", ["000001"]),
+                ("RPS突破 + 高位旗形整理", []),
+            ]
+        )
+    content = payload["card"]["elements"][0]["text"]["content"]
+    assert "000001 平安银行" in content
+    assert "暂无符合股票" in content
+    assert "雪球" not in content
+
+
+def test_stock_names_prefer_local_mapping() -> None:
+    with tempfile.NamedTemporaryFile(suffix=".db") as database:
+        with sqlite3.connect(database.name) as conn:
+            conn.execute(
+                "CREATE TABLE stock_basic ("
+                "symbol TEXT PRIMARY KEY, name TEXT NOT NULL, updated_at TEXT)"
+            )
+            conn.execute(
+                "INSERT INTO stock_basic(symbol, name, updated_at) VALUES (?, ?, ?)",
+                ("000001", "平安银行", "2026-10-29"),
+            )
+            conn.commit()
+        notifier = FeishuNotifier(make_settings())
+        notifier.settings.db_path = database.name
+        assert notifier._get_stock_names(["000001"]) == {"000001": "平安银行"}

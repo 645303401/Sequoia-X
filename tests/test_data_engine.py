@@ -111,3 +111,36 @@ def test_get_all_symbols_uses_named_stock_basic_fields(monkeypatch) -> None:
     with tempfile.TemporaryDirectory() as tmp_dir:
         engine, _ = make_engine_in(tmp_dir)
         assert engine.get_all_symbols() == ["430047", "000001"]
+
+
+def test_market_regime_classifies_rising_index() -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        engine, _ = make_engine_in(tmp_dir)
+        dates = pd.date_range("2024-01-01", periods=90, freq="D")
+        closes = [100.0] * 60 + list(pd.Series(range(100, 130), dtype=float))
+        with sqlite3.connect(engine.db_path) as conn:
+            conn.executemany(
+                "INSERT INTO market_daily(index_code, date, close) VALUES (?, ?, ?)",
+                [("sh.000001", str(day.date()), close) for day, close in zip(dates, closes)],
+            )
+        regime = engine.get_market_regime()
+        assert regime.iloc[-1]["regime"] == "上升"
+        assert set(regime["regime"].dropna()) >= {"横盘", "上升"}
+
+
+def test_market_regime_falls_back_to_stock_pool_proxy() -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        engine, _ = make_engine_in(tmp_dir)
+        dates = pd.date_range("2024-01-01", periods=90, freq="D")
+        rows = []
+        for symbol in ("000001", "600000"):
+            closes = [100.0] * 60 + list(pd.Series(range(100, 130), dtype=float))
+            rows.extend((symbol, str(day.date()), close) for day, close in zip(dates, closes))
+        with sqlite3.connect(engine.db_path) as conn:
+            conn.executemany(
+                "INSERT INTO stock_daily(symbol, date, close) VALUES (?, ?, ?)",
+                rows,
+            )
+        regime = engine.get_market_regime()
+        assert regime["source"].iloc[-1] == "stock_equal_weight_proxy"
+        assert regime["regime"].iloc[-1] == "上升"
